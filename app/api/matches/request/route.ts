@@ -24,6 +24,12 @@ export async function POST(req: NextRequest) {
   }
 
   const userId = userData.user.id;
+  const { data: senderProfile } = await supabaseAdmin
+    .from("profiles")
+    .select("name")
+    .eq("id", userId)
+    .single();
+  const senderName = senderProfile?.name || "Someone";
 
   const { data: existing, error: existingError } = await supabaseAdmin
     .from("matches")
@@ -52,7 +58,7 @@ export async function POST(req: NextRequest) {
       await supabaseAdmin.from("notifications").insert({
         user_id: targetUserId,
         type: "match_request",
-        message: "New match request",
+        message: `New match request from ${senderName}`,
         match_id: existingMatch.id,
         is_read: false,
       });
@@ -74,7 +80,7 @@ export async function POST(req: NextRequest) {
   await supabaseAdmin.from("notifications").insert({
     user_id: targetUserId,
     type: "match_request",
-    message: "New match request",
+    message: `New match request from ${senderName}`,
     match_id: inserted.id,
     is_read: false,
   });

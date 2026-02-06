@@ -23,10 +23,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const senderId = userData.user.id;
+  const { data: senderProfile } = await supabaseAdmin
+    .from("profiles")
+    .select("name")
+    .eq("id", senderId)
+    .single();
+  const senderName = senderProfile?.name || "Someone";
+
   const { error } = await supabaseAdmin.from("notifications").insert({
     user_id: targetUserId,
     type: "match_request",
-    message: message || "New match request",
+    message: message || `New match request from ${senderName}`,
     match_id: matchId ?? null,
     is_read: false,
   });

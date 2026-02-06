@@ -4,8 +4,42 @@ import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type { Profile, Match, Message, Notification } from "@/types";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+
+const MAX_FILE_SIZE = 30 * 1024 * 1024;
+
+function getAvatarDataUrl(name?: string | null) {
+  const initial = (name || "U").trim().slice(0, 1).toUpperCase() || "U";
+  const colors = ["#f7c7d9", "#b7e3ff", "#ffd8a8", "#c7f5d9", "#e2d4ff"];
+  const colorIndex = initial.charCodeAt(0) % colors.length;
+  const bg = colors[colorIndex];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="100%" height="100%" rx="24" ry="24" fill="${bg}"/><text x="50%" y="54%" text-anchor="middle" font-size="20" font-family="Arial, sans-serif" fill="#111">${initial}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+async function uploadFile(file: File, pathPrefix: string) {
+  if (file.size > MAX_FILE_SIZE) {
+    throw new Error("File is too large. Max 30MB.");
+  }
+  const safeName = file.name.replace(/[^\w.\-]+/g, "_");
+  const filePath = `${pathPrefix}/${Date.now()}-${safeName}`;
+  const { error } = await supabase.storage.from("uploads").upload(filePath, file, { upsert: true });
+  if (error) throw error;
+  const { data } = supabase.storage.from("uploads").getPublicUrl(filePath);
+  return {
+    publicUrl: data.publicUrl,
+    fileName: file.name,
+    fileType: file.type || "application/octet-stream",
+    fileSize: file.size,
+  };
+}
+
+function uniqById<T extends { id: string | number }>(items: T[]) {
+  return Array.from(new Map(items.map(item => [item.id, item])).values());
+}
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
   const [matches, setMatches] = useState<Match[]>([]);
   const [profiles, setProfiles] = useState<Record<string, Profile>>({});
@@ -15,11 +49,14 @@ export default function DashboardPage() {
   const [matchesError, setMatchesError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsError, setNotificationsError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatFile, setChatFile] = useState<File | null>(null);
+  const [chatSending, setChatSending] = useState(false);
 
   // Get current user
   useEffect(() => {
@@ -55,7 +92,7 @@ export default function DashboardPage() {
         }
 
         const matchData = (matchJson?.data as Match[]) || [];
-        setMatches(matchData);
+        setMatches(uniqById(matchData));
         setMatchesError(null);
 
         const matchIds = matchData?.map(m => [m.user1, m.user2]).flat() || [];
@@ -89,7 +126,7 @@ export default function DashboardPage() {
             headers: { Authorization: `Bearer ${accessToken2}` },
           });
           const nJson = await nRes.json();
-          if (nRes.ok) setNotifications(nJson.data || []);
+          if (nRes.ok) setNotifications(uniqById(nJson.data || []));
           else setNotificationsError(nJson.error || nRes.statusText);
         }
       } catch (err) {
@@ -127,7 +164,7 @@ export default function DashboardPage() {
     }
 
     const inserted = json?.data as Match;
-    setMatches(prev => [...prev, inserted]);
+    setMatches(prev => uniqById([...prev, inserted]));
   };
 
   // Inline chat fetch + realtime
@@ -135,12 +172,16 @@ export default function DashboardPage() {
     if (!activeMatchId) return;
 
     let isMounted = true;
+    let inFlight = false;
 
     async function fetchMessages() {
+      if (inFlight) return;
+      inFlight = true;
       const session = await supabase.auth.getSession();
       const accessToken = session.data?.session?.access_token;
       if (!accessToken) {
         setChatError("No access token. Please re-login.");
+        inFlight = false;
         return;
       }
 
@@ -150,23 +191,27 @@ export default function DashboardPage() {
       const json = await res.json();
       if (!res.ok) {
         setChatError(json?.error || "Failed to load messages");
+        inFlight = false;
         return;
       }
       if (isMounted) {
         setChatError(null);
         setMessages((json?.data as Message[]) || []);
       }
+      inFlight = false;
     }
 
     fetchMessages();
+    const interval = setInterval(fetchMessages, 3000);
 
     return () => {
       isMounted = false;
+      clearInterval(interval);
     };
   }, [activeMatchId]);
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !userId || !activeMatchId) return;
+    if ((!newMessage.trim() && !chatFile) || !userId || !activeMatchId) return;
     const session = await supabase.auth.getSession();
     const accessToken = session.data?.session?.access_token;
     if (!accessToken) {
@@ -174,23 +219,46 @@ export default function DashboardPage() {
       return;
     }
 
-    const res = await fetch("/api/messages/send", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({ matchId: activeMatchId, text: newMessage.trim() }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      setChatError(json?.error || "Failed to send");
-      return;
-    }
+    setChatSending(true);
+    try {
+      let filePayload = null;
+      if (chatFile) {
+        const uploaded = await uploadFile(chatFile, `messages/${activeMatchId}`);
+        filePayload = {
+          fileUrl: uploaded.publicUrl,
+          fileName: uploaded.fileName,
+          fileType: uploaded.fileType,
+          fileSize: uploaded.fileSize,
+        };
+      }
 
-    setChatError(null);
-    setMessages(prev => [...prev, json.data as Message]);
-    setNewMessage("");
+      const res = await fetch("/api/messages/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          matchId: activeMatchId,
+          text: newMessage.trim(),
+          ...filePayload,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setChatError(json?.error || "Failed to send");
+        return;
+      }
+
+      setChatError(null);
+      setMessages(prev => [...prev, json.data as Message]);
+      setNewMessage("");
+      setChatFile(null);
+    } catch (err: any) {
+      setChatError(err?.message || "Failed to upload file");
+    } finally {
+      setChatSending(false);
+    }
   };
 
   const refreshMatches = async () => {
@@ -200,7 +268,7 @@ export default function DashboardPage() {
       .select("*")
       .or(`user1.eq.${userId},user2.eq.${userId}`)
       .order("created_at", { ascending: false });
-    setMatches(matchData || []);
+    if (matchData) setMatches(uniqById(matchData));
   };
 
   const refreshNotifications = async (accessToken: string) => {
@@ -208,7 +276,7 @@ export default function DashboardPage() {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     const nJson = await nRes.json();
-    if (nRes.ok) setNotifications(nJson.data || []);
+    if (nRes.ok) setNotifications(uniqById(nJson.data || []));
     else setNotificationsError(nJson.error || nRes.statusText);
   };
 
@@ -235,10 +303,13 @@ export default function DashboardPage() {
       return;
     }
 
-    setNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, is_read: true } : n)));
+    setNotifications(prev => prev.filter(n => n.id !== notificationId));
 
-    if (action === "accept" && json?.match?.id) {
-      setMatches(prev => prev.map(m => (m.id === json.match.id ? { ...m, status: "accepted" } : m)));
+    if (action === "accept") {
+      const acceptedId = json?.match?.id || matchId || null;
+      if (acceptedId) {
+        setMatches(prev => prev.map(m => (m.id === acceptedId ? { ...m, status: "accepted" } : m)));
+      }
     }
     if (action === "reject" && json?.matchId) {
       setMatches(prev => prev.filter(m => m.id !== json.matchId));
@@ -261,7 +332,16 @@ export default function DashboardPage() {
       {userId && profiles[userId] && (
         <div className="mb-6 p-4 rounded-2xl bg-white/90 backdrop-blur border border-pink-100 shadow-md flex justify-between items-center">
           <div>
-            <div className="text-lg font-semibold text-black">{profiles[userId].name}</div>
+            <div className="flex items-center gap-3">
+              <Link href={`/profile/${userId}`} className="inline-flex">
+                <img
+                  src={profiles[userId].avatar_url || getAvatarDataUrl(profiles[userId].name)}
+                  alt={`${profiles[userId].name} avatar`}
+                  className="h-10 w-10 rounded-full border border-pink-200"
+                />
+              </Link>
+              <div className="text-lg font-semibold text-black">{profiles[userId].name}</div>
+            </div>
             <div className="text-sm text-black">
               Teach: <span className="font-medium text-black">{profiles[userId].teach_skill}</span> · Learn:{" "}
               <span className="font-medium text-black">{profiles[userId].learn_skill}</span>
@@ -282,9 +362,11 @@ export default function DashboardPage() {
             >
               Start Chat
             </button>
-            <Link href="/dashboard/profile" className="px-3 py-1.5 bg-sky-500 text-black rounded-full text-sm shadow hover:bg-sky-600">
-              Edit Profile
-            </Link>
+            {userId && (
+              <Link href={`/profile/${userId}`} className="px-3 py-1.5 bg-sky-500 text-black rounded-full text-sm shadow hover:bg-sky-600">
+                Profile
+              </Link>
+            )}
           </div>
         </div>
       )}
@@ -294,16 +376,57 @@ export default function DashboardPage() {
 
       {/* Other Users */}
       <div className="mb-6 rounded-2xl bg-white/90 backdrop-blur border border-pink-100 shadow-md p-4">
-        <h2 className="text-xl font-semibold mb-3 text-black">Other Users</h2>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <h2 className="text-xl font-semibold text-black">Other Users</h2>
+          <input
+            className="w-64 max-w-full border border-slate-200 rounded-full px-3 py-1.5 text-sm text-black bg-white focus:outline-none focus:ring-2 focus:ring-pink-200"
+            placeholder="Search skill or name..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
         {otherUsersError && <p className="text-red-600">{otherUsersError}</p>}
         <ul>
-          {otherUsers.map(u => (
+          {otherUsers
+            .filter(u => {
+              const q = searchQuery.trim().toLowerCase();
+              if (!q) return true;
+              return (
+                u.name?.toLowerCase().includes(q) ||
+                u.teach_skill?.toLowerCase().includes(q) ||
+                u.learn_skill?.toLowerCase().includes(q)
+              );
+            })
+            .map(u => (
             <li key={u.id} className="mb-2 p-3 border border-slate-100 rounded-xl flex justify-between items-center bg-white shadow-sm">
-              <div>
-                <div className="font-semibold text-black">{u.name}</div>
-                <div className="text-sm text-black">
-                  Teach: <span className="font-medium text-black">{u.teach_skill}</span> · Learn:{" "}
-                  <span className="font-medium text-black">{u.learn_skill}</span>
+              <div className="flex items-center gap-3">
+                <Link href={`/profile/${u.id}`} className="inline-flex">
+                  <img
+                    src={u.avatar_url || getAvatarDataUrl(u.name)}
+                    alt={`${u.name} avatar`}
+                    className="h-9 w-9 rounded-full border border-pink-200"
+                  />
+                </Link>
+                <div>
+                  <Link href={`/profile/${u.id}`} className="font-semibold text-black hover:underline">
+                    {u.name}
+                  </Link>
+                  <div className="mt-1 flex flex-wrap gap-2 text-xs text-black">
+                    {u.teach_skill
+                      ?.split(",")
+                      .map(s => s.trim())
+                      .filter(Boolean)
+                      .map(s => (
+                        <span key={`t-${u.id}-${s}`} className="px-2 py-0.5 rounded-full bg-slate-100">Teach: {s}</span>
+                      ))}
+                    {u.learn_skill
+                      ?.split(",")
+                      .map(s => s.trim())
+                      .filter(Boolean)
+                      .map(s => (
+                        <span key={`l-${u.id}-${s}`} className="px-2 py-0.5 rounded-full bg-slate-100">Learn: {s}</span>
+                      ))}
+                  </div>
                 </div>
               </div>
               <button
@@ -324,10 +447,34 @@ export default function DashboardPage() {
         ) : (
           <ul>
             {notifications.map(n => (
-              <li key={n.id} className="mb-2 p-3 border border-slate-100 rounded-xl bg-white shadow-sm">
+              <li key={`${n.id}-${n.created_at}`} className="mb-2 p-3 border border-slate-100 rounded-xl bg-white shadow-sm">
                 <div className="text-xs text-black">{new Date(n.created_at).toLocaleString()}</div>
+                {(n.sender_name || n.sender_id) && (
+                  <div className="mt-1 flex items-center gap-2 text-sm text-black">
+                    <Link href={`/profile/${n.sender_id}`} className="inline-flex">
+                      <img
+                        src={n.sender_avatar_url || getAvatarDataUrl(n.sender_name || n.sender_id)}
+                        alt={n.sender_name ? `${n.sender_name} avatar` : "User avatar"}
+                        className="h-6 w-6 rounded-full border border-pink-200"
+                      />
+                    </Link>
+                    <span>
+                      From:{" "}
+                      {n.sender_id ? (
+                        <Link
+                          href={`/profile/${n.sender_id}`}
+                          className="font-medium text-black underline decoration-pink-300 underline-offset-2 hover:decoration-pink-500"
+                        >
+                          {n.sender_name || `User ${n.sender_id.slice(0, 6)}…`}
+                        </Link>
+                      ) : (
+                        n.sender_name
+                      )}
+                    </span>
+                  </div>
+                )}
                 <div className={n.is_read ? "text-black" : "font-semibold text-black"}>{n.message}</div>
-                {n.type === "match_request" && (
+                {n.type === "match_request" && !n.is_read && (
                   <div className="mt-2 flex gap-2">
                     <button
                       className="px-3 py-1.5 bg-emerald-500 text-black rounded-full text-sm shadow hover:bg-emerald-600"
@@ -349,53 +496,6 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {/* Chat (Prominent) */}
-      <div className="mb-6 rounded-2xl border border-sky-100 p-4 bg-white/90 backdrop-blur shadow-md">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-xl font-semibold text-black">
-            Chat
-            {activeMatchId && (() => {
-              const active = matches.find(m => m.id === activeMatchId);
-              const otherId = active ? (active.user1 === userId ? active.user2 : active.user1) : null;
-              const name = otherId ? (profiles[otherId]?.name || `User ${otherId.slice(0, 6)}…`) : null;
-              return name ? <span className="ml-2 text-sm text-black">with {name}</span> : null;
-            })()}
-          </h2>
-          {activeMatchId && (
-            <span className="text-xs text-black">
-              Match ID: {activeMatchId}
-            </span>
-          )}
-        </div>
-        {activeMatchId ? (
-          <>
-            {chatError && <p className="text-sm text-red-600 mb-2">{chatError}</p>}
-            <div className="h-64 overflow-y-auto mb-2 flex flex-col gap-2 border border-slate-100 rounded-xl p-3 bg-slate-50">
-              {messages.map(msg => (
-                <div key={msg.id} className={`px-3 py-2 rounded-2xl text-sm text-black ${msg.sender === userId ? "bg-sky-200 self-end" : "bg-rose-100 self-start"}`}>
-                  {msg.text}
-                </div>
-              ))}
-            </div>
-            <div className="flex gap-2">
-              <input
-                className="flex-1 border border-slate-200 p-2 rounded-full bg-white text-black placeholder:text-black focus:outline-none focus:ring-2 focus:ring-pink-200"
-                value={newMessage}
-                onChange={e => setNewMessage(e.target.value)}
-                placeholder="Type a message..."
-                onKeyDown={e => e.key === "Enter" && handleSendMessage()}
-              />
-              <button
-                className="bg-sky-500 text-black px-4 rounded-full shadow hover:bg-sky-600"
-                onClick={handleSendMessage}
-              >Send</button>
-            </div>
-          </>
-        ) : (
-          <p className="text-sm text-black">Matches хэсгээс “Start Chat” дарж эхлүүл.</p>
-        )}
-      </div>
-
       {/* Matches */}
       <div className="rounded-2xl bg-white/90 backdrop-blur border border-pink-100 shadow-md p-4">
         <h2 className="text-xl font-semibold mb-3 text-black">Matches</h2>
@@ -411,17 +511,27 @@ export default function DashboardPage() {
               const isActive = activeMatchId === m.id;
               return (
                 <li
-                  key={m.id}
+                  key={`${m.id}-${m.user1}-${m.user2}`}
                   className={`mb-2 p-3 border border-slate-100 rounded-xl ${canChat ? "cursor-pointer" : "bg-white shadow-sm"} ${isActive ? "border-sky-300 bg-sky-50" : ""}`}
                   onClick={() => canChat && setActiveMatchId(m.id)}
                 >
                   <div className="flex justify-between items-center gap-4">
-                    <span>
-                      {displayName} |{" "}
-                      <span className={`capitalize font-semibold ${m.status === "accepted" ? "text-emerald-600" : "text-black"}`}>
-                        {m.status === "accepted" ? "Matched" : m.status}
+                    <div className="flex items-center gap-3">
+                      <img
+                        src={profile?.avatar_url || getAvatarDataUrl(displayName)}
+                        alt={`${displayName} avatar`}
+                        className="h-8 w-8 rounded-full border border-pink-200"
+                      />
+                      <span>
+                        <Link href={`/profile/${otherId}`} className="text-black hover:underline">
+                          {displayName}
+                        </Link>{" "}
+                        |{" "}
+                        <span className={`capitalize font-semibold ${m.status === "accepted" ? "text-emerald-600" : "text-black"}`}>
+                          {m.status === "accepted" ? "Matched" : m.status}
+                        </span>
                       </span>
-                    </span>
+                    </div>
                     {isActive && (
                       <span className="text-xs px-2 py-0.5 rounded-full bg-sky-500 text-black">Active</span>
                     )}
@@ -434,17 +544,13 @@ export default function DashboardPage() {
                         }`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (canChat) setActiveMatchId(m.id);
+                          if (!canChat) return;
+                          router.push(`/chat/${m.id}`);
                         }}
                         disabled={!canChat}
                       >
-                        Start Chat
+                        {canChat ? "Open Chat" : "Start Chat"}
                       </button>
-                      {canChat ? (
-                        <Link href={`/chat/${m.id}`} className="text-black hover:underline text-sm">Open Chat Page</Link>
-                      ) : (
-                        <span className="text-xs text-black">Accept хийсний дараа chat нээгдэнэ</span>
-                      )}
                     </div>
                   </div>
                 </li>

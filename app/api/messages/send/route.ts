@@ -6,9 +6,9 @@ export async function POST(req: NextRequest) {
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
   if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { matchId, text } = await req.json();
-  if (!matchId || !text) {
-    return NextResponse.json({ error: "matchId and text are required" }, { status: 400 });
+  const { matchId, text, fileUrl, fileName, fileType, fileSize } = await req.json();
+  if (!matchId || (!text && !fileUrl)) {
+    return NextResponse.json({ error: "matchId and text or fileUrl are required" }, { status: 400 });
   }
 
   let supabaseAdmin;
@@ -40,7 +40,15 @@ export async function POST(req: NextRequest) {
 
   const { data, error } = await supabaseAdmin
     .from("messages")
-    .insert({ match_id: matchId, sender: userId, text })
+    .insert({
+      match_id: matchId,
+      sender: userId,
+      text: text || "",
+      file_url: fileUrl ?? null,
+      file_name: fileName ?? null,
+      file_type: fileType ?? null,
+      file_size: fileSize ?? null,
+    })
     .select()
     .single();
 
